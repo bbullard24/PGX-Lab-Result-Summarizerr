@@ -3,6 +3,7 @@ import base64
 import re
 import json
 import uuid
+from typing import List
 
 import streamlit as st
 import openai
@@ -14,44 +15,58 @@ import streamlit_authenticator as stauth
 
 load_dotenv()
 
-if "session_id" not in st.session_state:
-    st.session_state.session_id = str(uuid.uuid4())
+# Initialize session state variables
+def init_session_state():
+    if "session_id" not in st.session_state:
+        st.session_state.session_id = str(uuid.uuid4())
+    if "tool_calls" not in st.session_state:
+        st.session_state.tool_calls = []
+    if "chat_log" not in st.session_state:
+        st.session_state.chat_log = []
+    if "in_progress" not in st.session_state:
+        st.session_state.in_progress = False
+    if "uploader_key" not in st.session_state:
+        st.session_state.uploader_key = 0
+    if "processed_files" not in st.session_state:
+        st.session_state.processed_files = {}
+
+init_session_state()
 
 def str_to_bool(str_input):
-    if not isinstance(str_input, str):
-        return False
-    return str_input.lower() == "true"
+    return isinstance(str_input, str) and str_input.lower() == "true"
 
-openai_api_key = os.environ.get("OPENAI_API_KEY")
-instructions = os.environ.get("RUN_INSTRUCTIONS", "")
-enabled_file_upload_message = os.environ.get(
-    "ENABLED_FILE_UPLOAD_MESSAGE", "Upload a file"
-)
-azure_openai_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
-azure_openai_key = os.environ.get("AZURE_OPENAI_KEY")
-authentication_required = str_to_bool(os.environ.get("AUTHENTICATION_REQUIRED", False))
+# Initialize OpenAI client
+def init_openai_client():
+    openai_api_key = os.environ.get("OPENAI_API_KEY")
+    azure_openai_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
+    azure_openai_key = os.environ.get("AZURE_OPENAI_KEY")
+    
+    if azure_openai_endpoint and azure_openai_key:
+        return openai.AzureOpenAI(
+            api_key=azure_openai_key,
+            api_version="2024-05-01-preview",
+            azure_endpoint=azure_openai_endpoint,
+        )
+    return openai.OpenAI(api_key=openai_api_key)
 
-if authentication_required:
+client = init_openai_client()
+
+# Authentication setup
+def setup_authentication():
+    authentication_required = str_to_bool(os.environ.get("AUTHENTICATION_REQUIRED", False))
+    if not authentication_required:
+        return None
+    
     if "credentials" in st.secrets:
-        authenticator = stauth.Authenticate(
+        return stauth.Authenticate(
             st.secrets["credentials"].to_dict(),
             st.secrets["cookie"]["name"],
             st.secrets["cookie"]["key"],
             st.secrets["cookie"]["expiry_days"],
         )
-    else:
-        authenticator = None
+    return None
 
-client = None
-if azure_openai_endpoint and azure_openai_key:
-    client = openai.AzureOpenAI(
-        api_key=azure_openai_key,
-        api_version="2024-05-01-preview",
-        azure_endpoint=azure_openai_endpoint,
-    )
-else:
-    client = openai.OpenAI(api_key=openai_api_key)
-
+authenticator = setup_authentication()
 
 class EventHandler(AssistantEventHandler):
     @override
@@ -107,51 +122,24 @@ class EventHandler(AssistantEventHandler):
                     with st.chat_message("Assistant"):
                         st.markdown(output_msg, True)
                         st.session_state.chat_log.append({"name": "assistant", "msg": output_msg})
-        elif (
-            tool_call.type == "function"
-            and self.current_run.status == "requires_action"
-        ):
-            with st.chat_message("Assistant"):
-                msg = f"### Function Calling: {tool_call.function.name}"
-                st.markdown(msg, True)
-                st.session_state.chat_log.append({"name": "assistant", "msg": msg})
 
-            tool_outputs = []
-            for submit_tool_call in self.current_run.required_action.submit_tool_outputs.tool_calls:
-                tool_function_output = TOOL_MAP[submit_tool_call.function.name](
-                    **json.loads(submit_tool_call.function.arguments)
-                )
-                tool_outputs.append({
-                    "tool_call_id": submit_tool_call.id,
-                    "output": tool_function_output
-                })
+def create_thread():
+    return client.beta.threads.create()
 
-            with client.beta.threads.runs.submit_tool_outputs_stream(
-                thread_id=st.session_state.thread.id,
-                run_id=self.current_run.id,
-                tool_outputs=tool_outputs,
-                event_handler=EventHandler(),
-            ) as stream:
-                stream.until_done()
-
-
-def create_thread(content, file): return client.beta.threads.create()
-def create_message(thread, content, file):
+def create_message(thread, content, files: List = None):
     attachments = []
-    if file is not None:
-        attachments.append({
-            "file_id": file.id,
-            "tools": [{"type": "code_interpreter"}, {"type": "file_search"}]
-        })
+    if files:
+        for file in files:
+            attachments.append({
+                "file_id": file.id,
+                "tools": [{"type": "code_interpreter"}, {"type": "file_search"}]
+            })
     client.beta.threads.messages.create(
         thread_id=thread.id, role="user", content=content, attachments=attachments
     )
 
-def create_file_link(file_name, file_id):
-    content = client.files.content(file_id)
-    content_type = content.response.headers["content-type"]
-    b64 = base64.b64encode(content.text.encode(content.encoding)).decode()
-    return f'<a href="data:{content_type};base64,{b64}" download="{file_name}">Download Link</a>'
+def handle_uploaded_files(uploaded_files):
+    return [client.files.create(file=file, purpose="assistants") for file in uploaded_files]
 
 def format_annotation(text):
     citations = []
@@ -167,10 +155,16 @@ def format_annotation(text):
     text_value += "\n\n" + "\n".join(citations)
     return text_value
 
-def run_stream(user_input, file, selected_assistant_id):
+def create_file_link(file_name, file_id):
+    content = client.files.content(file_id)
+    content_type = content.response.headers["content-type"]
+    b64 = base64.b64encode(content.text.encode(content.encoding)).decode()
+    return f'<a href="data:{content_type};base64,{b64}" download="{file_name}">Download Link</a>'
+
+def run_stream(user_input, files: List, selected_assistant_id):
     if "thread" not in st.session_state:
-        st.session_state.thread = create_thread(user_input, file)
-    create_message(st.session_state.thread, user_input, file)
+        st.session_state.thread = create_thread()
+    create_message(st.session_state.thread, user_input, files)
     with client.beta.threads.runs.stream(
         thread_id=st.session_state.thread.id,
         assistant_id=selected_assistant_id,
@@ -178,29 +172,34 @@ def run_stream(user_input, file, selected_assistant_id):
     ) as stream:
         stream.until_done()
 
-def handle_uploaded_file(uploaded_file):
-    return client.files.create(file=uploaded_file, purpose="assistants")
+def process_files(uploaded_files, user_msg, assistant_id):
+    if not uploaded_files:
+        return
+    
+    # Process each file in sequence
+    for file in uploaded_files:
+        file_key = f"{file.name}_{file.size}"
+        
+        # Skip if file was already processed
+        if file_key in st.session_state.processed_files:
+            continue
+            
+        with st.expander(f"Processing: {file.name}", expanded=True):
+            st.write(f"**Processing PDF:** {file.name}")
+            
+            # Upload and process the file
+            try:
+                openai_files = handle_uploaded_files([file])
+                run_stream(user_msg, openai_files, assistant_id)
+                st.session_state.processed_files[file_key] = True
+                st.success(f"Completed processing: {file.name}")
+            except Exception as e:
+                st.error(f"Error processing {file.name}: {str(e)}")
 
 def render_chat():
     for chat in st.session_state.chat_log:
         with st.chat_message(chat["name"]):
             st.markdown(chat["msg"], True)
-
-if "tool_calls" not in st.session_state:
-    st.session_state.tool_calls = []
-
-if "chat_log" not in st.session_state:
-    st.session_state.chat_log = []
-
-if "in_progress" not in st.session_state:
-    st.session_state.in_progress = False
-
-# Initialize the uploader key counter
-if "uploader_key" not in st.session_state:
-    st.session_state.uploader_key = 0
-
-def disable_form():
-    st.session_state.in_progress = True
 
 def reset_chat():
     st.session_state.chat_log = []
@@ -209,55 +208,63 @@ def reset_chat():
 def start_new_chat():
     st.session_state.session_id = str(uuid.uuid4())
     st.session_state.chat_log = []
+    st.session_state.processed_files = {}
     st.session_state.uploader_key += 1
     st.rerun()
 
 def load_chat_screen(assistant_id, assistant_title):
-    uploaded_file = st.sidebar.file_uploader(
-        enabled_file_upload_message,
-        type=["txt", "pdf", "csv", "json", "geojson", "xlsx", "xls"],
+    uploaded_files = st.sidebar.file_uploader(
+        os.environ.get("ENABLED_FILE_UPLOAD_MESSAGE", "Upload PDF files"),
+        type=["pdf"],
         disabled=st.session_state.in_progress,
-        key=f"file_uploader_{st.session_state.uploader_key}"  # Add this dynamic key
+        key=f"file_uploader_{st.session_state.uploader_key}",
+        accept_multiple_files=True
     )
+    
     st.title(assistant_title if assistant_title else "")
-    user_msg = st.chat_input("Message", on_submit=disable_form, disabled=st.session_state.in_progress)
+    
+    user_msg = st.chat_input(
+        "Message", 
+        on_submit=disable_form, 
+        disabled=st.session_state.in_progress
+    )
+    
     if user_msg:
         render_chat()
         with st.chat_message("user"):
             st.markdown(user_msg, True)
         st.session_state.chat_log.append({"name": "user", "msg": user_msg})
-        file = handle_uploaded_file(uploaded_file) if uploaded_file else None
-        run_stream(user_msg, file, assistant_id)
+        
+        if uploaded_files:
+            process_files(uploaded_files, user_msg, assistant_id)
+        else:
+            run_stream(user_msg, None, assistant_id)
+            
         st.session_state.in_progress = False
-        st.session_state.tool_call = None
         st.rerun()
+    
     render_chat()
 
-def main():
-    multi_agents = os.environ.get("OPENAI_ASSISTANTS", None)
-    single_agent_id = os.environ.get("ASSISTANT_ID", None)
-    single_agent_title = os.environ.get("ASSISTANT_TITLE", "Assistants API UI")
+def disable_form():
+    st.session_state.in_progress = True
 
-    if (
-        authentication_required
-        and "credentials" in st.secrets
-        and authenticator is not None
-    ):
+def main():
+    if authenticator and not st.session_state.get("authentication_status"):
         authenticator.login()
         if not st.session_state["authentication_status"]:
             st.error("Username/password is incorrect")
             return
-        authenticator.logout(location="sidebar")
+    
+    multi_agents = os.environ.get("OPENAI_ASSISTANTS", None)
+    single_agent_id = os.environ.get("ASSISTANT_ID", None)
+    single_agent_title = os.environ.get("ASSISTANT_TITLE", "Assistants API UI")
 
     with st.sidebar:
+        if authenticator and st.session_state.get("authentication_status"):
+            authenticator.logout()
+            
         if st.button("➕ Start New Chat"):
             start_new_chat()
-            st.components.v1.html(
-                """<script>window.location.reload();</script>""",
-                height=0,
-            )
-
-            
 
     if multi_agents:
         assistants_json = json.loads(multi_agents)
