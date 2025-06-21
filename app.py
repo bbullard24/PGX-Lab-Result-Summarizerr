@@ -205,12 +205,6 @@ def reset_chat():
     st.session_state.chat_log = []
     st.session_state.in_progress = False
 
-def start_new_chat():
-    st.session_state.session_id = str(uuid.uuid4())
-    st.session_state.chat_log = []
-    st.session_state.processed_files = {}
-    st.session_state.uploader_key += 1
-    st.rerun()
 
 def load_chat_screen(assistant_id, assistant_title):
     uploaded_files = st.sidebar.file_uploader(
@@ -263,8 +257,6 @@ def main():
         if authenticator and st.session_state.get("authentication_status"):
             authenticator.logout()
             
-        if st.button("➕ Start New Chat"):
-            start_new_chat()
 
     if multi_agents:
         assistants_json = json.loads(multi_agents)
